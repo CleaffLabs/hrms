@@ -1,0 +1,418 @@
+name: Deploy Django Horilla Service to GCP VM
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      run_migrations:
+        description: 'Run database migrations'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  APP_SERVICE_NAME: horilla-service
+  APP_GCP_PROJECT: ${{ secrets.APP_GCP_PROJECT }}
+  IMAGE_TAG: ${{ github.sha }}
+  VM_INSTANCE_NAME: ${{ secrets.VM_INSTANCE_NAME }}
+  VM_ZONE: ${{ secrets.VM_ZONE }}
+
+jobs:
+  sonar-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        id: sonar
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_CLIENT_TOKEN }}
+        run: |
+          npm install -g sonar-scanner
+          sonar-scanner \
+            -Dsonar.projectKey=${{ env.APP_SERVICE_NAME }} \
+            -Dsonar.sources=. \
+            -Dsonar.host.url=${{ secrets.SONAR_SERVICE_URL }} \
+            -Dsonar.login=$SONAR_TOKEN
+          
+          sleep 5
+          SONAR_STATUS=$(curl -s -u $SONAR_TOKEN: "${{ secrets.SONAR_SERVICE_URL }}/api/qualitygates/project_status?projectKey=${{ env.APP_SERVICE_NAME }}" | jq -r '.projectStatus.status')
+          echo "SONAR_STATUS=$SONAR_STATUS" >> $GITHUB_OUTPUT
+          
+          if [ "$SONAR_STATUS" != "OK" ]; then
+            echo "Sonar quality gate failed with status: $SONAR_STATUS"
+            exit 1
+          fi
+
+  deploy-horilla-service:
+    runs-on: ubuntu-latest
+    needs: sonar-scan
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          workload_identity_provider: '${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}'
+          service_account: '${{ secrets.SERVICE_ACCOUNT_EMAIL }}'
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v1'
+
+      - name: 'Set up Docker auth'
+        run: |
+          gcloud auth configure-docker gcr.io
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      # Build and push Django service image
+      - name: Build & Push Horilla Service Image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: gcr.io/${{ env.APP_GCP_PROJECT }}/horilla-service:${{ env.IMAGE_TAG }}
+          file: ./Dockerfile
+          platforms: linux/amd64
+
+      # Generate optimized entrypoint script
+      - name: Generate optimized entrypoint script
+        run: |
+          cat > entrypoint-prod.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          echo "Starting Horilla service..."
+          echo "Waiting for database to be ready..."
+
+          # Wait for PostgreSQL to be ready
+          until PGPASSWORD=$POSTGRES_PASSWORD psql -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '\q'; do
+            echo "PostgreSQL is unavailable - sleeping"
+            sleep 2
+          done
+
+          echo "PostgreSQL is up - continuing..."
+
+          # Check if this is first run (migrations needed)
+          MIGRATION_NEEDED=false
+          
+          # Check if migration marker exists
+          if [ ! -f /app/migration_completed.marker ]; then
+            MIGRATION_NEEDED=true
+          fi
+          
+          # Override migration if explicitly requested
+          if [ "$RUN_MIGRATIONS" = "true" ]; then
+            MIGRATION_NEEDED=true
+          fi
+
+          if [ "$MIGRATION_NEEDED" = "true" ]; then
+            echo "Running database migrations..."
+            python3 manage.py makemigrations
+            python3 manage.py migrate
+            python3 manage.py collectstatic --noinput
+            
+            # Create admin user if it doesn't exist
+            python3 manage.py shell << PYTHON
+          import os
+          from django.contrib.auth import get_user_model
+          User = get_user_model()
+          if not User.objects.filter(username='admin').exists():
+              try:
+                  from django.core.management import call_command
+                  call_command('createhorillauser', 
+                             first_name='admin', 
+                             last_name='admin', 
+                             username='admin', 
+                             password='${{ secrets.ADMIN_PASSWORD }}', 
+                             email='info@cleaff.com', 
+                             phone='1234567890')
+                  print("Admin user created successfully")
+              except Exception as e:
+                  print(f"Error creating admin user: {e}")
+          else:
+              print("Admin user already exists")
+          PYTHON
+            
+            # Mark migration as completed
+            touch /app/migration_completed.marker
+            echo "Migration completed and marked"
+          else
+            echo "Migrations already completed, skipping..."
+          fi
+
+          echo "Starting Gunicorn server..."
+          exec gunicorn --bind 0.0.0.0:8000 --workers 3 --timeout 120 horilla.wsgi:application
+          EOF
+          
+          chmod +x entrypoint-prod.sh
+
+      # Generate docker-compose file for Django service
+      - name: Generate docker-compose file
+        run: |
+          cat > docker-compose.horilla.yml << 'EOF'
+          version: '3.8'
+          
+          networks:
+            app-network:
+              external: true
+          
+          volumes:
+            horilla-media:
+            horilla-static:
+          
+          services:
+            # Django Horilla Service
+            horilla-service:
+              image: gcr.io/${{ env.APP_GCP_PROJECT }}/horilla-service:${{ env.IMAGE_TAG }}
+              container_name: horilla-service
+              restart: unless-stopped
+              networks:
+                - app-network
+              ports:
+                - "8002:8000"
+              volumes:
+                - horilla-media:/app/media
+                - horilla-static:/app/static
+                - ./entrypoint-prod.sh:/app/entrypoint-prod.sh
+              environment:
+                - DJANGO_SETTINGS_MODULE=horilla.settings
+                - POSTGRES_HOST=postgres-db
+                - POSTGRES_DB=app_db
+                - POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+                - POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+                - DATABASE_URL=postgres://${{ secrets.POSTGRES_USER }}:${{ secrets.POSTGRES_PASSWORD }}@postgres-db:5432/app_db
+                - DJANGO_SECRET_KEY=${{ secrets.DJANGO_SECRET_KEY }}
+                - DJANGO_DEBUG=False
+                - DJANGO_ALLOWED_HOSTS=*
+                - RUN_MIGRATIONS=${{ github.event.inputs.run_migrations || 'false' }}
+              command: sh /app/entrypoint-prod.sh
+              healthcheck:
+                test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 90s
+              logging:
+                driver: "json-file"
+                options:
+                  max-size: "10m"
+                  max-file: "3"
+              # Wait for PostgreSQL dependency
+              external_links:
+                - "postgres-db:postgres-db"
+          EOF
+
+      # Generate deployment script
+      - name: Generate deployment script
+        run: |
+          cat > deploy-horilla.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          echo "=== Horilla Service Deployment Started ==="
+          
+          # Check if PostgreSQL is running
+          echo "=== Checking Dependencies ==="
+          POSTGRES_RUNNING=$(docker ps --filter "name=postgres-db" --filter "status=running" --format "table {{.Names}}" | grep -c postgres-db || true)
+          if [ "$POSTGRES_RUNNING" -eq 0 ]; then
+            echo "ERROR: PostgreSQL is not running. Please deploy backend service first."
+            exit 1
+          fi
+          
+          # Check PostgreSQL health
+          timeout 30 bash -c '
+            until docker exec postgres-db pg_isready -U ${{ secrets.POSTGRES_USER }} -d app_db; do
+              echo "Waiting for PostgreSQL to be healthy..."
+              sleep 5
+            done
+          ' || {
+            echo "ERROR: PostgreSQL health check failed"
+            exit 1
+          }
+          
+          # Ensure app network exists
+          if ! docker network ls | grep -q app-network; then
+            echo "Creating app-network..."
+            docker network create app-network
+          fi
+          
+          # Create volumes if they don't exist
+          docker volume create horilla-media || true
+          docker volume create horilla-static || true
+          
+          echo "=== Pulling latest Horilla service image ==="
+          docker-compose -f docker-compose.horilla.yml pull
+          
+          echo "=== Stopping existing Horilla service ==="
+          docker-compose -f docker-compose.horilla.yml stop horilla-service || true
+          docker-compose -f docker-compose.horilla.yml rm -f horilla-service || true
+          
+          echo "=== Starting Horilla service ==="
+          docker-compose -f docker-compose.horilla.yml up -d
+          
+          echo "=== Waiting for Horilla service to be healthy ==="
+          sleep 45
+          
+          # Wait for Horilla service with extended timeout for Django startup
+          timeout 180 bash -c '
+            until curl -f -s http://localhost:8002/; do 
+              echo "Waiting for Horilla service..."
+              sleep 10
+            done
+          '
+          
+          echo "=== Horilla service deployment completed ==="
+          
+          # Log deployment status
+          echo "$(date): Horilla service deployed successfully" >> /var/log/deployment.log
+          
+          # Show status
+          docker-compose -f docker-compose.horilla.yml ps
+          
+          # Create service registry entry
+          mkdir -p /tmp/service-registry
+          echo "{\"service\": \"horilla-service\", \"port\": 8002, \"health_endpoint\": \"/\", \"status\": \"running\", \"deployed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"dependencies\": [\"postgres-db\"], \"type\": \"django\"}" > /tmp/service-registry/horilla-service.json
+          
+          echo "=== Testing Horilla service endpoints ==="
+          curl -I http://localhost:8002/ || echo 'Horilla service health check failed'
+          
+          # Check Django admin
+          curl -I http://localhost:8002/admin/ || echo 'Django admin endpoint check failed'
+          EOF
+          
+          chmod +x deploy-horilla.sh
+
+      # Copy files to VM
+      - name: Copy deployment files to VM
+        run: |
+          gcloud compute scp docker-compose.horilla.yml ${{ env.VM_INSTANCE_NAME }}:~/ --zone=${{ env.VM_ZONE }}
+          gcloud compute scp deploy-horilla.sh ${{ env.VM_INSTANCE_NAME }}:~/ --zone=${{ env.VM_ZONE }}
+          gcloud compute scp entrypoint-prod.sh ${{ env.VM_INSTANCE_NAME }}:~/ --zone=${{ env.VM_ZONE }}
+
+      # Execute deployment
+      - name: Deploy Horilla Service
+        run: |
+          gcloud compute ssh ${{ env.VM_INSTANCE_NAME }} --zone=${{ env.VM_ZONE }} --command="
+            chmod +x ~/deploy-horilla.sh
+            chmod +x ~/entrypoint-prod.sh
+            sudo ~/deploy-horilla.sh
+          "
+
+      # Verify deployment and Django-specific checks
+      - name: Verify Horilla Service Deployment
+        run: |
+          gcloud compute ssh ${{ env.VM_INSTANCE_NAME }} --zone=${{ env.VM_ZONE }} --command="
+            echo '=== Horilla Service Status ==='
+            sudo docker-compose -f docker-compose.horilla.yml ps
+            
+            echo '=== All Services Status ==='
+            sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+            
+            echo '=== Horilla Service Health Check ==='
+            curl -I http://localhost:8002/ | head -5 || echo 'Horilla service health check failed'
+            
+            echo '=== Django Admin Check ==='
+            curl -I http://localhost:8002/admin/ | head -5 || echo 'Django admin check failed'
+            
+            echo '=== Database Connection Test ==='
+            # Test database connectivity from Horilla service
+            sudo docker exec horilla-service python3 manage.py dbshell --command=\"SELECT 1;\" || echo 'Database connectivity test failed'
+            
+            echo '=== Django Static Files Check ==='
+            sudo docker exec horilla-service ls -la /app/static/ | head -10 || echo 'Static files not found'
+            
+            echo '=== Django Migration Status ==='
+            sudo docker exec horilla-service python3 manage.py showmigrations --verbosity=0 || echo 'Migration status check failed'
+            
+            echo '=== Horilla Service Logs (last 30 lines) ==='
+            sudo docker-compose -f docker-compose.horilla.yml logs --tail=30 horilla-service
+            
+            echo '=== Service Integration Test ==='
+            # Test if Horilla service can reach PostgreSQL
+            sudo docker exec horilla-service ping -c 2 postgres-db && echo 'PostgreSQL reachable' || echo 'PostgreSQL NOT reachable'
+            
+            echo '=== Service Registry Status ==='
+            ls -la /tmp/service-registry/
+            echo 'Horilla Service:'
+            cat /tmp/service-registry/horilla-service.json || echo 'Horilla service registry not found'
+            
+            echo '=== Django System Check ==='
+            sudo docker exec horilla-service python3 manage.py check --deploy || echo 'Django system check failed'
+            
+            echo '=== Volume Status ==='
+            sudo docker volume ls | grep horilla
+            
+            echo '=== Media Files Check ==='
+            sudo docker exec horilla-service ls -la /app/media/ || echo 'Media directory not accessible'
+          "
+
+      # Performance and monitoring checks
+      - name: Run Performance Checks
+        run: |
+          gcloud compute ssh ${{ env.VM_INSTANCE_NAME }} --zone=${{ env.VM_ZONE }} --command="
+            echo '=== Performance Checks ==='
+            
+            # Memory usage of Django service
+            echo 'Django Service Memory Usage:'
+            sudo docker stats --no-stream --format 'table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}' horilla-service
+            
+            # Response time test
+            echo 'Response Time Test:'
+            time curl -s -o /dev/null http://localhost:8002/ && echo 'Response time test completed'
+            
+            # Concurrent connection test (simple)
+            echo 'Simple Load Test (5 concurrent requests):'
+            for i in {1..5}; do
+              curl -s -o /dev/null -w 'Request %{local_ip}:%{local_port} -> %{remote_ip}:%{remote_port} | Status: %{response_code} | Time: %{time_total}s\n' http://localhost:8002/ &
+            done
+            wait
+            
+            echo '=== Performance Checks Completed ==='
+          "
+
+      # Setup monitoring for Django service
+      - name: Setup Django Service Monitoring
+        run: |
+          gcloud compute ssh ${{ env.VM_INSTANCE_NAME }} --zone=${{ env.VM_ZONE }} --command="
+            # Create Django-specific monitoring script
+            cat > ~/monitor_horilla.sh << 'MONITOR'
+          #!/bin/bash
+          
+          # Check Horilla service health
+          if ! curl -f -s http://localhost:8002/ > /dev/null; then
+            echo \"[\$(date)] ERROR: Horilla service health check failed\"
+            # Restart service if unhealthy
+            sudo docker-compose -f /home/\$USER/docker-compose.horilla.yml restart horilla-service
+          fi
+          
+          # Check database connectivity
+          if ! sudo docker exec horilla-service python3 manage.py dbshell --command=\"SELECT 1;\" > /dev/null 2>&1; then
+            echo \"[\$(date)] ERROR: Horilla service database connectivity failed\"
+          fi
+          
+          # Check disk space for media files
+          DISK_USAGE=\$(df /var/lib/docker/volumes/horilla-media/_data 2>/dev/null | tail -1 | awk '{print \$(NF-1)}' | sed 's/%//')
+          if [ \"\$DISK_USAGE\" -gt 80 ]; then
+            echo \"[\$(date)] WARNING: Horilla media volume is \${DISK_USAGE}% full\"
+          fi
+          MONITOR
+            
+            chmod +x ~/monitor_horilla.sh
+            
+            # Add to existing crontab
+            (crontab -l 2>/dev/null | grep -v monitor_horilla; echo \"*/5 * * * * /home/\$USER/monitor_horilla.sh >> /var/log/horilla-monitor.log 2>&1\") | crontab -
+            
+            echo 'Horilla monitoring script installed'
+          "
