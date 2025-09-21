@@ -8,12 +8,12 @@ services:
       context: .
       dockerfile: Dockerfile
     # Replace with your actual GCR image path
-#    image: gcr.io/your-gcp-project/horilla-server:latest
+#    image: gcr.io/turretsapp/horilla-server:latest
     ports:
       # Map the host's port 80 (standard HTTP) to the container's port 8000
       - "8008:8008"
     environment: # Changed from localhost to db
-      DATABASE_URL: "postgresql://postgres:postgres@db:5432/hrms"
+      DATABASE_URL: "postgresql://postgres:postgres@db:5439/hrms"
     command: sh ./entrypoint.sh
     volumes:
       - hrms-data:/mnt/app/hrms/media
@@ -34,7 +34,7 @@ services:
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
       PGDATA: /mnt/app/hrms/pgdata
     ports:
-      - 5432:5432
+      - 5439:5432
     restart: unless-stopped
     volumes:
       - hrms-data:/mnt/app/hrms/pgdata
