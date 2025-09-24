@@ -13,7 +13,7 @@ on:
         type: boolean
 
 env:
-  APP_SERVICE_NAME: horilla-service
+  APP_SERVICE_NAME: cleaff-hrms
   APP_GCP_PROJECT: ${{ secrets.APP_GCP_PROJECT }}
   IMAGE_TAG: ${{ github.sha }}
   VM_INSTANCE_NAME: ${{ secrets.VM_INSTANCE_NAME }}
