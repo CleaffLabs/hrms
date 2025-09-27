@@ -18,12 +18,12 @@ env:
   IMAGE_TAG: ${{ github.sha }}
   VM_INSTANCE_NAME: ${{ secrets.VM_INSTANCE_NAME }}
   VM_ZONE: ${{ secrets.VM_ZONE }}
-  is_sonar_step_mandatory: ${{secrets.is_sonar_step_mandatory}}
+  is_sonar_step_mandatory: ${{vars.is_sonar_step_mandatory}}
 
 jobs:
   sonar-scan:
     runs-on: ubuntu-latest
-    if: ${{ env.is_sonar_step_mandatory != 'false' }}
+    if: ${{ vars.is_sonar_step_mandatory != 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
