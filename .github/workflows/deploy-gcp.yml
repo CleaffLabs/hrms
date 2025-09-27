@@ -18,11 +18,12 @@ env:
   IMAGE_TAG: ${{ github.sha }}
   VM_INSTANCE_NAME: ${{ secrets.VM_INSTANCE_NAME }}
   VM_ZONE: ${{ secrets.VM_ZONE }}
+  is_sonar_step_mandatory: ${{secrets.is_sonar_step_mandatory}}
 
 jobs:
   sonar-scan:
     runs-on: ubuntu-latest
-    if: ${{ secrets.is_sonar_step_mandatory != 'false' }}
+    if: ${{ env.is_sonar_step_mandatory != 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -50,7 +51,7 @@ jobs:
 
   deploy-horilla-service:
     runs-on: ubuntu-latest
-    needs: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' && 'sonar-scan' || '' }}
+    needs: [sonar-scan]
     permissions:
       contents: 'read'
       id-token: 'write'
