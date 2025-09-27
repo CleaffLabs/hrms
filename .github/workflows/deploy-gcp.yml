@@ -79,12 +79,13 @@ jobs:
 
       - name: 'Set up Docker auth'
         run: |
-          gcloud auth configure-docker gcr.io
+            gcloud auth configure-docker gcr.io --quiet
+            # Verify authentication
+            gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin gcr.io
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
-      # Build and push Django service image
       - name: Build & Push Horilla Service Image
         uses: docker/build-push-action@v4
         with:
@@ -93,6 +94,10 @@ jobs:
           tags: gcr.io/${{ env.APP_GCP_PROJECT }}/horilla-service:${{ env.IMAGE_TAG }}
           file: ./Dockerfile
           platforms: linux/amd64
+          builder: ${{ steps.buildx.outputs.name }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # Generate optimized entrypoint script
       - name: Generate optimized entrypoint script
