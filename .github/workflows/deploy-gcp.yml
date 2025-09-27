@@ -50,7 +50,7 @@ jobs:
 
   deploy-horilla-service:
     runs-on: ubuntu-latest
-    needs: ${{ secrets.is_sonar_step_mandatory != 'false' && 'sonar-scan' || '' }}
+    needs: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' && 'sonar-scan' || '' }}
     permissions:
       contents: 'read'
       id-token: 'write'
