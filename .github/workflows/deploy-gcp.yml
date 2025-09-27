@@ -13,7 +13,7 @@ on:
         type: boolean
 
 env:
-  APP_SERVICE_NAME: cleaff-hrms
+  APP_SERVICE_NAME: horilla-service
   APP_GCP_PROJECT: ${{ secrets.APP_GCP_PROJECT }}
   IMAGE_TAG: ${{ github.sha }}
   VM_INSTANCE_NAME: ${{ secrets.VM_INSTANCE_NAME }}
@@ -30,18 +30,16 @@ jobs:
 
       - name: SonarQube Scan
         id: sonar
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_CLIENT_TOKEN }}
         run: |
           npm install -g sonar-scanner
           sonar-scanner \
             -Dsonar.projectKey=${{ env.APP_SERVICE_NAME }} \
             -Dsonar.sources=. \
             -Dsonar.host.url=${{ secrets.SONAR_SERVICE_URL }} \
-            -Dsonar.login=$SONAR_TOKEN
+            -Dsonar.login=${{ secrets.SONAR_CLIENT_TOKEN }}
           
           sleep 5
-          SONAR_STATUS=$(curl -s -u $SONAR_TOKEN: "${{ secrets.SONAR_SERVICE_URL }}/api/qualitygates/project_status?projectKey=${{ env.APP_SERVICE_NAME }}" | jq -r '.projectStatus.status')
+          SONAR_STATUS=$(curl -s -u ${{ secrets.SONAR_CLIENT_TOKEN }}: "${{ secrets.SONAR_SERVICE_URL }}/api/qualitygates/project_status?projectKey=${{ env.APP_SERVICE_NAME }}" | jq -r '.projectStatus.status')
           echo "SONAR_STATUS=$SONAR_STATUS" >> $GITHUB_OUTPUT
           
           if [ "$SONAR_STATUS" != "OK" ]; then
@@ -135,7 +133,7 @@ jobs:
                              first_name='admin', 
                              last_name='admin', 
                              username='admin', 
-                             password='${{ secrets.ADMIN_PASSWORD }}', 
+                             password='${{ secrets.HRMS_ADMIN_PASSWORD }}', 
                              email='info@cleaff.com', 
                              phone='1234567890')
                   print("Admin user created successfully")
