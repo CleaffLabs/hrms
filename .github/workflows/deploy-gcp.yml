@@ -39,19 +39,27 @@ jobs:
             -Dsonar.sources=. \
             -Dsonar.host.url=${{ secrets.SONAR_SERVICE_URL }} \
             -Dsonar.login=${{ secrets.SONAR_CLIENT_TOKEN }}
-          
+
           sleep 5
           SONAR_STATUS=$(curl -s -u ${{ secrets.SONAR_CLIENT_TOKEN }}: "${{ secrets.SONAR_SERVICE_URL }}/api/qualitygates/project_status?projectKey=${{ env.APP_SERVICE_NAME }}" | jq -r '.projectStatus.status')
           echo "SONAR_STATUS=$SONAR_STATUS" >> $GITHUB_OUTPUT
-          
+
           if [ "$SONAR_STATUS" != "OK" ]; then
             echo "Sonar quality gate failed with status: $SONAR_STATUS"
             exit 1
           fi
 
+      - name: Set sonar result
+        if: success()
+        run: echo "SONAR_SCAN=true" >> $GITHUB_ENV
+
+    outputs:
+      sonar_scan: ${{ env.SONAR_SCAN }}
+
   deploy-horilla-service:
     runs-on: ubuntu-latest
-    needs: ${{ env.is_sonar_step_mandatory != 'false' && 'sonar-scan' || '' }}
+    needs: sonar-scan
+    if: ${{ always() && (needs.sonar-scan.result == 'success' || needs.sonar-scan.result == 'skipped') }}
     permissions:
       contents: 'read'
       id-token: 'write'
