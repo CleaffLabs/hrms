@@ -22,6 +22,7 @@ env:
 jobs:
   sonar-scan:
     runs-on: ubuntu-latest
+    if: ${{ secrets.is_sonar_step_mandatory != 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -49,7 +50,7 @@ jobs:
 
   deploy-horilla-service:
     runs-on: ubuntu-latest
-    needs: sonar-scan
+    needs: ${{ secrets.is_sonar_step_mandatory != 'false' && 'sonar-scan' || '' }}
     permissions:
       contents: 'read'
       id-token: 'write'
